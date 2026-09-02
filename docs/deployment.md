@@ -155,17 +155,19 @@ python3 bench/bench.py
 
 ## 6. Performance reference (measured @230W, 512k, DSpark n=3)
 
+All rows below are reproducible with `bench/bench.py` on an idle engine. DSpark throughput scales with draft acceptance, which is strongly content-dependent — bench.py prints per-scenario acceptance, and numbers from other harnesses/prompts are not comparable.
+
 | Scenario | Value |
 |---|---|
-| Single-stream decode (shallow) | 49 tok/s (58 with n=6) |
-| Single-stream decode (85k–366k depth) | **88–92 tok/s, depth-independent** |
+| Single-stream decode (shallow) | 44–49 tok/s (higher on high-acceptance content) |
+| Single-stream decode (85k–178k depth) | **90–96 tok/s, depth-independent** |
 | TTFT | 1k=1.1s / 85k=16s / 163k=32s / 366k=94s (prefill ~4k t/s) |
 | Vision QA | first ~1.4s / hot 0.4–0.5s |
-| Agent aggregate | C8=379 / C16=497 (peak) / C32=404 t/s |
-| Chat aggregate | C32=439 t/s |
+| Chat aggregate (no shared prefix, acc ~1.1) | C16=236 / C32=225 t/s |
+| Agent aggregate (3.2k shared prefix, acc ~1.33) | C8=207 / C16=258 (peak) / C32=242 t/s |
 | Concurrency sweet spot | ≤8 interactive / ≤16 agent; >16 queueing degrades |
 | KV pool | 4.719M tokens; 9 concurrent full-512k sessions |
-| DSpark acceptance length | 2.28 (n=3) / 2.67 (n=6) |
+| DSpark acceptance length | 1.1–1.4 tok/draft on bench content (n=3); up to ~2.3 on more predictable content |
 
 ## 7. Operations
 

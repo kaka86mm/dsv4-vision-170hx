@@ -12,14 +12,15 @@ The CMP 170HX is an A100-class die crippled for mining: compute fuse-locked, mem
 
 ## Measured performance
 
-All numbers from a 4× CMP 170HX box (PP4, 512k context, DSpark speculative decoding n=3, FULL CUDA graphs):
+All numbers measured with [`bench/bench.py`](bench/bench.py) on an idle engine (PP4, 512k context, DSpark n=3, FULL CUDA graphs). DSpark speculative throughput scales with draft acceptance, which is **strongly content-dependent** (1.1–1.4 tok/draft on these prompts) — always compare numbers together with their reported acceptance; results from other harnesses/prompts are not comparable.
 
 | Workload | Result |
 |---|---|
-| Single-stream decode (shallow) | 49 tok/s |
-| Single-stream decode (85k–366k depth) | **88–92 tok/s — flat across depth** |
-| Time to first token | 1k=1.1s / 85k=16s / 366k=94s (prefill ~4k tok/s) |
-| Agent concurrency (3.2k shared prefix) | C8=379 / **C16=497 peak** / C32=404 tok/s aggregate |
+| Single-stream decode (shallow) | 44–49 tok/s |
+| Single-stream decode (85k–178k depth) | **90–96 tok/s — flat across depth** |
+| Time to first token | 93k=17.6s / 178k=36.4s (prefill ~4k tok/s) |
+| Chat concurrency (no shared prefix) | C16=236 / C32=225 t/s aggregate (acceptance ~1.1) |
+| Agent concurrency (3.2k shared prefix) | C8=207 / **C16=258 peak** / C32=242 t/s aggregate (acceptance ~1.33) |
 | Vision QA (hot) | 0.4s per query (≤384 tokens per image) |
 | KV cache pool | 4.72M tokens (9 concurrent full-window sessions) |
 | Tool calling | verified (deepseek_v4 parser) |
