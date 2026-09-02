@@ -1,72 +1,105 @@
-# DSV4-Flash-Vision-Exp on 4× CMP 170HX
+# dsv4-vision-170hx
 
-DeepSeek-V4-Flash-Vision-Exp（多模态 284B MoE + 32 层 ViT）在 4× 解锁 CMP 170HX（GA100 sm80, PCIe Gen2 x4）上的生产部署全套。
+Production deployment of **DeepSeek-V4-Flash-Vision-Exp** (multimodal MoE, 284B total / 13B active + 32-layer ViT) on **4× unlocked NVIDIA CMP 170HX** — GA100 mining cards repurposed as 64GB sm_80 inference GPUs, connected via PCIe Gen2 x4 with no P2P.
 
-**实测性能**（PP4 · 512k 窗口 · DSpark n=3 投机解码 · FULL cudagraph）：
+This repository contains everything needed to reproduce the deployment from bare metal: source patches, build tooling, launch configuration, benchmark suite, and the complete troubleshooting record.
 
-| 场景 | 数值 |
+## Why this exists
+
+The CMP 170HX is an A100-class die crippled for mining: compute fuse-locked, memory strap-limited, PCIe capped at Gen1 x4. After software unlocking (64GB HBM2e, full SM count, Gen2 retrain), it becomes one of the cheapest ways to accumulate large-memory inference capacity — but every mainstream serving stack assumes Hopper or newer. This repo documents the four hard blockers that stop DeepSeek-V4-Vision from running on sm_80 and the patches that resolve them, so the same recipe applies to any A100/A800 fleet.
+
+## Measured performance
+
+All numbers from a 4× CMP 170HX box (PP4, 512k context, DSpark speculative decoding n=3, FULL CUDA graphs):
+
+| Workload | Result |
 |---|---|
-| 单流解码（浅层） | 49 tok/s |
-| 单流解码（85k–366k 深度） | **88–92 tok/s，深度无关**（稀疏注意力只读 top-512） |
-| TTFT | 1k=1.1s / 85k=16s / 366k=94s（prefill ~4k t/s） |
-| Agent 并发聚合 | C8=379 / **C16=497（峰值）** / C32=404 t/s |
-| 视觉问答 | 热问 0.4s（≤384 tok/图） |
-| KV 池 | 472 万 token（满 512k 窗口 9 路） |
-| 工具调用 | ✓ deepseek_v4 parser |
+| Single-stream decode (shallow) | 49 tok/s |
+| Single-stream decode (85k–366k depth) | **88–92 tok/s — flat across depth** |
+| Time to first token | 1k=1.1s / 85k=16s / 366k=94s (prefill ~4k tok/s) |
+| Agent concurrency (3.2k shared prefix) | C8=379 / **C16=497 peak** / C32=404 tok/s aggregate |
+| Vision QA (hot) | 0.4s per query (≤384 tokens per image) |
+| KV cache pool | 4.72M tokens (9 concurrent full-window sessions) |
+| Tool calling | verified (deepseek_v4 parser) |
 
-## 仓库结构
+The depth-flat decode curve is a property of the architecture's sparse attention (top-512 selection): per-token cost does not scale with context length. Deep-context sessions are limited by prefill latency, not decode throughput.
+
+## Repository layout
 
 ```
 docs/
-  dsv4-vision-deploy-runbook.md      # 主 runbook（裸机 → 视觉服务生产，独立完整）
-  machine-prep-reference.md          # 机器底座参考（解锁/驱动/Gen2/230W/Docker）
-  benchmarks-text-model.md           # 同硬件纯文本模型(0731)基准数据(参考)
+  deployment.md          # Full deployment guide (bare metal → production service)
+  machine-setup.md       # Hardware unlocking, driver, PCIe Gen2, power management
+  benchmarks-0731.md     # Reference benchmarks of the text-only model on identical hardware
 scripts/
-  launch.sh          # 生产启动（PP4/512k/DSpark-n3/FULL图，含全部参数红线）
-  build-entry.sh     # 常驻编译容器入口（重启自动续编，ccache 增量）
-  sm80-patches.py    # sm80 三件套+DSpark嵌入补丁（选择器/PP中继/末阶嵌入）
+  launch.sh              # Production launch script with all tuning parameters
+  build-entry.sh         # Persistent build container entrypoint (resumable compilation)
+  sm80-patches.py        # Source patches: sm80 backend routing, PP input relay,
+                         #   drafter embedding on last pipeline rank
 bench/
-  bench.py           # 验收基准（正确性/单流/深度TTFT分离/并发）
+  bench.py               # Acceptance benchmark (correctness / single-stream /
+                         #   depth-separated decode / concurrency)
 ```
 
-## 快速开始
+## The four sm_80 blockers
+
+| Blocker | Symptom | Fix |
+|---|---|---|
+| No native FP8 on GA100 | `fp8e4nv not supported` at kernel compile | Route to the Ampere attention backend (ROCm Triton path + `fp8_sm80` software encode/decode) |
+| Vision expert routing needs `input_ids` under pipeline parallelism | `vision MoE routing requires input_ids` on non-first PP ranks | Relay `input_ids` through `IntermediateTensors` broadcast (3 patches) |
+| DSpark drafter aliases the target embedding on the last PP rank | `needs the target's embedding on the last stage` | Build `embed_tokens` on the last rank when speculative decoding is active (+1 GB) |
+| CUDA-graph corruption with multimodal models | Text queries return content from unrelated requests | Upstream PR #54566 `fix breakable cg` (2-line config change), cherry-picked |
+
+## Quick start
 
 ```bash
-# 0. 裸机底座（解锁/驱动/Gen2/230W/Docker）→ docs/machine-prep-reference.md §0-3
-# 1. 下载模型 (~157GB)
-HF_ENDPOINT=https://hf-mirror.com hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --local-dir ~/models/dsv4-flash-vision-exp
-# 2. 组装源码树 + 打补丁 + 构建 —— 见 docs/dsv4-vision-deploy-runbook.md §2-3
-python3 scripts/sm80-patches.py    # 在源码树上执行
-# 3. 启动
+# 1. Hardware setup (unlock / driver / Gen2 / 230W / Docker)
+#    → follow docs/machine-setup.md sections 0–3
+#
+# 2. Download the checkpoint (~157 GB)
+HF_ENDPOINT=https://hf-mirror.com hf download \
+  deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --local-dir ~/models/dsv4-flash-vision-exp
+#
+# 3. Assemble the source tree and apply patches
+#    → follow docs/deployment.md §2 (vision-v3 recipe)
+python3 scripts/sm80-patches.py
+#
+# 4. Build (persistent container, survives reboots via ccache)
+bash scripts/build-entry.sh   # inside the build container
+#
+# 5. Launch
 sudo scripts/launch.sh
-# 4. 验收
+#
+# 6. Verify
 python3 bench/bench.py --quick
 ```
 
-## 四个 sm80 硬阻塞与解法（本仓库核心技术点）
+## Key configuration decisions
 
-| 阻塞 | 解法 |
-|---|---|
-| sm80 无原生 FP8（`fp8e4nv` 编译崩） | Ampere 后端（ROCm Triton 路径 + `fp8_sm80` 软件编解码） |
-| bias_vl 视觉路由需 input_ids，PP 非首阶没有 | PP input_ids 中继（IntermediateTensors 广播，3 处 hunks） |
-| DSpark 草稿器在 PP 末阶别名嵌入表 | spec 开启时末阶也构建 embed_tokens（+1GB） |
-| 图模式下文本返回无关内容 | 上游 PR #54566 的 `fix breakable cg`（2 行 config）单摘 |
+- **Pipeline parallel (PP=4), never tensor parallel.** Gen2 x4 without P2P makes TP all-reduce latency-dominated; PP moves activations 3 times per step instead of synchronizing 86 times.
+- **Layer partition `12,11,11,9`.** The last rank carries the DSpark drafter, output head, and embedding patch — giving it fewer layers rebalances memory and grows the KV pool 3.3×.
+- **DSpark n=3, not n=5 or n=6.** The vision checkpoint ships a 3-layer nextn drafter; the engine requires `num_speculative_tokens` divisible by 3. n=6 is 18% faster single-stream but collapses under concurrency (3× worse aggregate at C=16).
+- **FULL_AND_PIECEWISE CUDA graphs + pinned NCCL (`Ring`/`Simple`).** Enforce-eager mode runs at 3.3 tok/s — 15× slower than graph mode.
+- **`--entrypoint /opt/venv/bin/vllm` explicit.** Images committed from build containers inherit `bash` as the entrypoint.
 
-## 测量铁律（深度解码测试防坑）
+## Benchmark methodology rules
 
-1. TTFT 必须流式分离（首 content 时刻），绝不用 total/tokens 当解码速率
-2. token 数用 usage（DSpark 多 token/chunk）
-3. 重启后首个请求丢弃（JIT 冷启）
-4. prompt 首 token 随机化（防前缀缓存）
+These rules are encoded in `bench/bench.py`; violating any of them produces misleading numbers (each was learned from a real misdiagnosis):
 
-## 单机互斥说明
+1. **Separate TTFT from decode time.** Never divide total time by token count — prefill dominates at depth.
+2. **Count tokens from `usage`, not stream chunks.** Speculative decoding emits multiple tokens per chunk.
+3. **Discard the first request after engine restart.** Triton JIT compilation inflates it.
+4. **Randomize the first token of benchmark prompts.** Prefix caching returns stale results for repeated prompts.
 
-4×64GB 显存放不下两个 167GB 级模型 — 本服务独占 GPU。同一配方也可部署纯文本 0731
-（见 machine-prep-reference.md），两者切换 = 停一个容器起另一个（~10min）。
+## Hardware requirements
 
-## 关键参数红线
+- 4× CMP 170HX (8GB hynix variant) unlocked to 64GB — or any 4× 64GB sm_80 GPUs (A100/A800)
+- ≥3TB free disk (checkpoint 157GB + build artifacts + images)
+- ≥200GB system RAM
+- Docker with NVIDIA Container Toolkit
+- Power: 230W software cap per card (250W+ causes transient spikes that trigger Xid 43)
 
-- PP=4 禁 TP（Gen2 x4 无 P2E）；`VLLM_PP_LAYER_PARTITION=12,11,11,9`（KV 池 3.3×）
-- DSpark **n=3**（VL 草稿器 3 层 nextn，n 须整除 3；n=6 单流 +18% 但并发聚合崩）
-- `--entrypoint /opt/venv/bin/vllm` 显式（commit 镜像默认 bash）
-- util ≤0.93；enforce-eager 会 3.3 tok/s（禁用）
+## License
+
+MIT — see [LICENSE](LICENSE). The patched components originate from [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) and [vllm-project/vllm PR #54566](https://github.com/vllm-project/vllm/pull/54566); respect their licenses when redistributing.
