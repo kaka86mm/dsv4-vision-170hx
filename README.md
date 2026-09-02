@@ -33,6 +33,8 @@ docs/
   deployment.md          # Full deployment guide (EN) — [中文版](deployment.zh-CN.md) (bare metal → production service)
   machine-setup.zh-CN.md # Hardware unlocking (中文), driver, PCIe Gen2, power management
   benchmarks-0731.zh-CN.md # Reference benchmarks (中文) of the text-only model on identical hardware
+patches/
+  ampere/               # Ampere attention backend (auto-copied by sm80-patches.py)
 scripts/
   launch.sh              # Production launch script with all tuning parameters
   build-entry.sh         # Persistent build container entrypoint (resumable compilation)

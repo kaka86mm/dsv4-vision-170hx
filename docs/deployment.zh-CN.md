@@ -75,27 +75,11 @@ git cherry-pick 5ab628dd1     # fix breakable cg — 仅2行config，修复图�
 git cherry-pick 2de7255a2     # enable mtp — VL草稿器管线
 # [坑] 不要用 PR 最新头（含 upstream main merge，带来 DeepGEMM 硬门，sm80 不可用）
 
-# 2.3 sm80 三件套（无此三件 sm80 无法运行）
-mkdir -p vllm/models/deepseek_v4/ampere
-# ampere 后端来自 wtdcode master（34行薄封装：ROCm Triton路径+fp8_sm80软编解码）
-# 从 master 分支取 ampere/{__init__,ampere_sparse}.py 放入上述目录
-# 然后在 nvidia/model.py 打两个补丁：
-#   (a) sm80 选择器：后端选择函数开头插入
-#       if device_capability is not None and device_capability.major == 8:
-#           from vllm.models.deepseek_v4.ampere.ampere_sparse import DeepseekV4AmpereMLAAttention
-#           return DeepseekV4AmpereMLAAttention
-#   (b) PP input_ids 中继（bias_vl 路由需要，3处 hunks）：
-#       make_empty_intermediate_tensors 加 "dsv4_img_ids": torch.zeros((batch_size,), int64)
-#       非首rank: if input_ids is None: input_ids = intermediate_tensors["dsv4_img_ids"]
-#       首rank发送: IntermediateTensors({"hidden_states":…, "dsv4_img_ids": input_ids.to(int64)})
-git add -A && git commit -m "sm80: ampere+selector+PP relay"
-
-# 2.4 DSpark 末阶嵌入补丁（投机解码必需）
-# nvidia/model.py 的 embed_tokens 构建条件改为：
-#   _spec = getattr(vllm_config, "speculative_config", None) is not None
-#   if get_pp_group().is_first_rank or (_spec and get_pp_group().is_last_rank):
-# 草稿器别名目标嵌入表 → spec开启时末阶也要建（+1GB显存）
-git commit -am "sm80: embed on last rank for drafter"
+# 2.3 一键打全部 sm80 补丁（Ampere后端+选择器+PP中继+末阶嵌入）
+#    sm80-patches.py 自动从 patches/ampere/ 拷入后端文件 — 无需手动获取。
+python3 /path/to/dsv4-vision-170hx/scripts/sm80-patches.py .
+# 预期输出: "applied: ['sm80-selector', 'pp-relay-empty', 'pp-relay-recv', 'pp-relay-send', 'embed-last-rank']"
+git add -A && git commit -m "sm80: ampere+selector+PP relay+embed"
 ```
 
 ## 3. 构建（常驻编译容器，重启自动续编）

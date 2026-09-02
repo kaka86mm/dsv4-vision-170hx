@@ -1,17 +1,43 @@
 #!/usr/bin/env python3
-"""sm80 三件套 + DSpark 末阶嵌入补丁 — 在 vision-v3 源码树上执行。
+"""sm80 四补丁 — 在 vision-v3 源码树上执行 (从仓库根目录运行, 自动定位源码树)。
 
-四个补丁解决 CMP 170HX (sm80) 跑 DSV4-Vision 的四个硬阻塞:
-  1. sm80 选择器   — fp8e4nv 崩溃 → Ampere 后端 (ROCm Triton + 软件编解码)
+解决 CMP 170HX (sm80) 跑 DSV4-Vision 的四个硬阻塞:
+  0. Ampere 后端   — sm80 无原生FP8 → ROCm Triton 路径 + 软件编解码 (自动拷入)
+  1. sm80 选择器   — 路由到 Ampere 后端
   2. PP 中继 x3    — bias_vl 路由需要 input_ids, PP 非首阶没有 → 广播
   3. 末阶嵌入      — DSpark 草稿器别名目标嵌入表 → spec 开启时末阶也建
 
-用法: cd <vision-v3 源码树> && python3 sm80-patches.py
-前置: ampere/{__init__,ampere_sparse}.py 已从 wtdcode master 放入 (见 runbook §2.3)
-"""
-import re, sys
+用法 (两种皆可):
+  cd <vision-v3 源码树> && python3 /path/to/sm80-patches.py
+  python3 /path/to/sm80-patches.py <vision-v3 源码树路径>
 
-MODEL_PY = "vllm/models/deepseek_v4/nvidia/model.py"
+ampere/ 文件自动从本仓库 patches/ampere/ 拷入源码树, 无需手动获取。
+"""
+import os, re, shutil, sys
+
+# 定位源码树: 参数指定 or 当前目录
+SRC = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
+MODEL_PY = os.path.join(SRC, "vllm/models/deepseek_v4/nvidia/model.py")
+AMPERE_DIR = os.path.join(SRC, "vllm/models/deepseek_v4/ampere")
+PATCH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "patches", "ampere")
+
+if not os.path.isfile(MODEL_PY):
+    print(f"ERROR: {MODEL_PY} not found.")
+    print("Usage: python3 sm80-patches.py <vision-v3-source-tree>")
+    sys.exit(1)
+
+# 0. 拷入 ampere 后端文件
+os.makedirs(AMPERE_DIR, exist_ok=True)
+for fname in ("__init__.py", "ampere_sparse.py"):
+    src_f = os.path.join(PATCH_DIR, fname)
+    dst_f = os.path.join(AMPERE_DIR, fname)
+    if not os.path.isfile(dst_f) and os.path.isfile(src_f):
+        shutil.copy2(src_f, dst_f)
+        print(f"copied: {fname} -> {AMPERE_DIR}")
+    elif os.path.isfile(dst_f):
+        print(f"exists: {dst_f}")
+    else:
+        print(f"WARNING: {src_f} not found in repo patches/; fetch from wtdcode master manually")
 
 c = open(MODEL_PY).read()
 applied = []

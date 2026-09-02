@@ -74,17 +74,12 @@ git cherry-pick 5ab628dd1     # fix breakable cg — 2-line config fix for graph
 git cherry-pick 2de7255a2     # enable mtp — VL drafter plumbing
 # [坑] Do NOT use the PR's latest head (contains upstream main merge → DeepGEMM hard gate, unusable on sm80)
 
-# 2.3 The sm80 kit (three pieces, without them sm80 cannot run)
-mkdir -p vllm/models/deepseek_v4/ampere
-# Take ampere/{__init__,ampere_sparse}.py from wtdcode master branch into the above dir
-# (a thin 34-line wrapper: ROCm Triton path + fp8_sm80 software encode/decode)
-# Then apply the selector + PP relay patches:
-python3 scripts/sm80-patches.py   # from this repository, run in the source tree root
-git add -A && git commit -m "sm80: ampere+selector+PP relay"
-
-# 2.4 DSpark last-rank embedding patch (required for speculative decoding)
-#    — included in sm80-patches.py (embed-on-last-rank when spec is active, +1GB)
-git commit -am "sm80: embed on last rank for drafter"
+# 2.3 Apply all four sm80 patches (Ampere backend + selector + PP relay + embed)
+#    sm80-patches.py automatically copies the ampere/ backend files from patches/
+#    into the source tree — no manual fetching needed.
+python3 /path/to/dsv4-vision-170hx/scripts/sm80-patches.py .
+# Expected output: "applied: ['sm80-selector', 'pp-relay-empty', 'pp-relay-recv', 'pp-relay-send', 'embed-last-rank']"
+git add -A && git commit -m "sm80: ampere+selector+PP relay+embed"
 ```
 
 ## 3. Build (persistent container, auto-resumes across reboots)
@@ -131,6 +126,16 @@ Use `scripts/launch.sh` from this repository, or the equivalent `docker run` wit
 curl -s localhost:8096/health        # 200
 docker logs dsv4-vision 2>&1 | grep "KV cache size"
 # Expect: ~4,719,096 tokens; "Maximum concurrency for 524,288: 9.00x"
+
+> **KV pool dependency chain** — the 4.72M number requires ALL of these simultaneously:
+> | Factor | Value | If different |
+> |---|---|---|
+> | `VLLM_PP_LAYER_PARTITION` | `12,11,11,9` | default (10,11,11,11) → ~1.4M (3.3× smaller) |
+> | `--max-num-seqs` | 16 | 32 → CUDA graph memory doubles → pool shrinks ~40% |
+> | `--gpu-memory-utilization` | 0.93 | 0.90 → proportionally less |
+> | embed-on-last-rank patch | applied | not applied → DSpark won't start |
+>
+> If your number differs, check each factor above before filing an issue.
 
 # 5.2 Text smoke (correctness — the cg-fix verification)
 curl -s localhost:8096/v1/chat/completions -H 'Content-Type: application/json' \

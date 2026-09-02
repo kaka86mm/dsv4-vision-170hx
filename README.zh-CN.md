@@ -33,6 +33,8 @@ docs/
   deployment.zh-CN.md    # 完整部署指南（裸机 → 生产服务）
   machine-setup.zh-CN.md # 硬件解锁、驱动、Gen2、功耗 (中文)
   benchmarks-0731.zh-CN.md # 同硬件纯文本模型(0731)基准参考
+patches/
+  ampere/               # Ampere attention backend (auto-copied by sm80-patches.py)
 scripts/
   launch.sh              # 生产启动脚本（全部调优参数）
   build-entry.sh         # 常驻编译容器入口（断点续编）
