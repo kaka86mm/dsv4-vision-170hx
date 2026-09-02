@@ -18,9 +18,9 @@ DeepSeek-V4-Flash-Vision-Exp（多模态 284B MoE + 32 层 ViT）在 4× 解锁 
 
 ```
 docs/
-  dsv4-vision-deploy-runbook.md      # 主 runbook（从文本服务基础上加装视觉服务）
-  PREREQUISITE-text-service-runbook.md  # 前置：文本服务 runbook（裸机→生产）
-  dsv4-4x170hx-acceptance-report.md  # 文本服务验收报告
+  dsv4-vision-deploy-runbook.md      # 主 runbook（裸机 → 视觉服务生产，独立完整）
+  machine-prep-reference.md          # 机器底座参考（解锁/驱动/Gen2/230W/Docker）
+  benchmarks-text-model.md           # 同硬件纯文本模型(0731)基准数据(参考)
 scripts/
   launch.sh          # 生产启动（PP4/512k/DSpark-n3/FULL图，含全部参数红线）
   build-entry.sh     # 常驻编译容器入口（重启自动续编，ccache 增量）
@@ -32,7 +32,7 @@ bench/
 ## 快速开始
 
 ```bash
-# 0. 前置：完成 docs/PREREQUISITE-text-service-runbook.md（解锁/驱动/230W/Docker）
+# 0. 裸机底座（解锁/驱动/Gen2/230W/Docker）→ docs/machine-prep-reference.md §0-3
 # 1. 下载模型 (~157GB)
 HF_ENDPOINT=https://hf-mirror.com hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --local-dir ~/models/dsv4-flash-vision-exp
 # 2. 组装源码树 + 打补丁 + 构建 —— 见 docs/dsv4-vision-deploy-runbook.md §2-3
@@ -58,6 +58,11 @@ python3 bench/bench.py --quick
 2. token 数用 usage（DSpark 多 token/chunk）
 3. 重启后首个请求丢弃（JIT 冷启）
 4. prompt 首 token 随机化（防前缀缓存）
+
+## 单机互斥说明
+
+4×64GB 显存放不下两个 167GB 级模型 — 本服务独占 GPU。同一配方也可部署纯文本 0731
+（见 machine-prep-reference.md），两者切换 = 停一个容器起另一个（~10min）。
 
 ## 关键参数红线
 

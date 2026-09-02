@@ -1,16 +1,20 @@
 # DSV4-Flash-Vision-Exp 视觉服务部署 Runbook（4× CMP 170HX）
 
-> 目标：在已部署 DSV4-Flash 文本服务的 4×170HX 机器上，加装 DeepSeek-V4-Flash-Vision-Exp 多模态服务（文本+图像，PP4，512k 窗口，DSpark 投机解码）。
-> 前置：先完成 `dsv4-flash-deploy-runbook.md`（解锁/Gen2/230W/Docker/构建容器全套已在位）。
+> 目标：在裸的 4× CMP 170HX 机器上，从零部署 DeepSeek-V4-Flash-Vision-Exp 多模态生产服务（文本+图像，PP4，512k 窗口，DSpark 投机解码）。
+> 注意：显存只够跑一个模型（权重 167GB 占满 4×64GB）。本服务独占 GPU；跑它之前停掉机器上其他模型容器。
+> 机器底座准备（解锁/驱动/Gen2/230W/Docker）如未做过，按 `machine-prep-reference.md` 第 0-3 节执行，本 runbook 从模型下载开始。
 > 全部命令实战验证于 2026-09-01/02。遇 [坑] 按提示处理。
 
-## 0. 前置状态确认
+## 0. 环境确认
 
 ```bash
-# 文本 runbook 的产物就位：
-docker images | grep -E "nvidia/cuda:13.0.2"          # 基础镜像
-ls ~/tools/vision-wheels/ ~/tools/vision-ccache/      # cp312轮子+编译缓存（文本runbook已建）
-nvidia-smi --query-gpu=pcie.link.gen.current --format=csv,noheader   # 全部 2
+# 机器底座就位（没做过 → 先走 machine-prep-reference.md §0-3）：
+nvidia-smi --query-gpu=index,name,memory.total,pcie.link.gen.current,power.limit --format=csv,noheader
+# 期望: 4× "NVIDIA CMP 170HX, 65536 MiB", gen=2, 230W
+docker info >/dev/null && echo docker-ok
+sudo docker images | grep nvidia/cuda:13.0.2 || sudo docker pull nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+# GPU 上如有其他模型容器，先停（互斥）:
+docker ps --format "{{.Names}}" | grep -E "vllm|glm|dsv4" && docker stop <名字>
 ```
 
 ## 1. 模型下载（~157GB）
@@ -24,6 +28,29 @@ HF_ENDPOINT=https://hf-mirror.com nohup ~/hfenv/bin/hf download \
   --local-dir ~/models/dsv4-flash-vision-exp > /tmp/dl-vision.log 2>&1 &
 # 日志出现 "✓ Downloaded" 即完整（hf自带校验）
 ```
+
+## 1.5 构建物料预备（cp312 轮子 + rustup-init）
+
+```bash
+mkdir -p ~/tools/vision-wheels
+cat > /tmp/dlwheels.sh <<'EOF'
+#!/bin/bash
+cd ~/tools/vision-wheels
+export http_proxy=http://<代理机> https_proxy=http://<代理机>
+for i in $(seq 1 30); do
+  ~/hfenv/bin/pip download --no-cache-dir --python-version 3.12 --implementation cp \
+    --abi cp312 --only-binary=:all: -d . \
+    torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0 && { echo DONE > status.txt; exit 0; }
+  echo "retry $i"; sleep 10
+done
+EOF
+chmod +x /tmp/dlwheels.sh && /tmp/dlwheels.sh   # ~3.3GB, 重试环扛烂网
+# rustup-init (USTC 镜像)
+curl -sL -o ~/tools/rustup-init \
+  https://mirrors.ustc.edu.cn/rust-static/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+chmod +x ~/tools/rustup-init
+```
+[坑] 宿主 pip 默认按本机 Python 版本下轮子 — 必须带 `--python-version 3.12 --abi cp312`（容器是 3.12）。
 
 ## 2. 源码树组装（vision-v3 配方）
 
@@ -221,7 +248,7 @@ curl -s localhost:8096/v1/chat/completions -H 'Content-Type: application/json' \
 - 深上下文（≤400k）**长写完全可用**（88 tok/s 深度平坦），只是首字等 prefill（85k=16s / 366k=94s）
 - 每图 ≤384 token；min_pixels 147456（过小图被放大）；宽高比 ≤8
 - 精度敏感判断开 thinking（返回字段名是 `reasoning` 非 `reasoning_content`）
-- 与文本线（dsv4-flash @8098）分工：浅层交互走文本线（90 tok/s），图像/深上下文走视觉线
+- 单机互斥：显存只够一个模型。需要纯文本高并发（C64 聚合 1600+ t/s）时换 `dsv4-flash-deploy-runbook.md` 的文本服务；需要图像/深上下文（88 tok/s 平到 400k）时换本服务
 
 ## 10. 已知边界
 
