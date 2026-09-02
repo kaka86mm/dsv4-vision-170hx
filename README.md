@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 # dsv4-vision-170hx
 
 Production deployment of **DeepSeek-V4-Flash-Vision-Exp** (multimodal MoE, 284B total / 13B active + 32-layer ViT) on **4× unlocked NVIDIA CMP 170HX** — GA100 mining cards repurposed as 64GB sm_80 inference GPUs, connected via PCIe Gen2 x4 with no P2P.
@@ -28,9 +30,9 @@ The depth-flat decode curve is a property of the architecture's sparse attention
 
 ```
 docs/
-  deployment.md          # Full deployment guide (bare metal → production service)
-  machine-setup.md       # Hardware unlocking, driver, PCIe Gen2, power management
-  benchmarks-0731.md     # Reference benchmarks of the text-only model on identical hardware
+  deployment.md          # Full deployment guide (EN) — [中文版](deployment.zh-CN.md) (bare metal → production service)
+  machine-setup.zh-CN.md # Hardware unlocking (中文), driver, PCIe Gen2, power management
+  benchmarks-0731.zh-CN.md # Reference benchmarks (中文) of the text-only model on identical hardware
 scripts/
   launch.sh              # Production launch script with all tuning parameters
   build-entry.sh         # Persistent build container entrypoint (resumable compilation)

@@ -1,42 +1,44 @@
-# DSV4-Flash-Vision-Exp 视觉服务部署 Runbook（4× CMP 170HX）
+[English](deployment.md) | [简体中文](deployment.zh-CN.md)
 
-> 目标：在裸的 4× CMP 170HX 机器上，从零部署 DeepSeek-V4-Flash-Vision-Exp 多模态生产服务（文本+图像，PP4，512k 窗口，DSpark 投机解码）。
-> 注意：显存只够跑一个模型（权重 167GB 占满 4×64GB）。本服务独占 GPU；跑它之前停掉机器上其他模型容器。
-> 机器底座准备（解锁/驱动/Gen2/230W/Docker）如未做过，按 `machine-prep-reference.md` 第 0-3 节执行，本 runbook 从模型下载开始。
-> 全部命令实战验证于 2026-09-01/02。遇 [坑] 按提示处理。
+# Deployment Guide — DSV4-Flash-Vision-Exp on 4× CMP 170HX
 
-## 0. 环境确认
+> Goal: deploy DeepSeek-V4-Flash-Vision-Exp as a production multimodal service (text + image, PP4, 512k context, DSpark speculative decoding) on bare 4× CMP 170HX hardware.
+> Note: VRAM fits exactly one model (167GB weights fill 4×64GB). This service owns the GPUs exclusively — stop any other model container before launching.
+> If the machine has not been prepared (unlock / driver / Gen2 / 230W / Docker), follow `machine-setup.zh-CN.md` §0–3 first; this guide starts from model download.
+> All commands verified on real hardware, 2026-09. `[坑]` markers flag known pitfalls.
+
+## 0. Environment check
 
 ```bash
-# 机器底座就位（没做过 → 先走 machine-prep-reference.md §0-3）：
+# Machine base in place (if not → machine-setup.zh-CN.md §0-3):
 nvidia-smi --query-gpu=index,name,memory.total,pcie.link.gen.current,power.limit --format=csv,noheader
-# 期望: 4× "NVIDIA CMP 170HX, 65536 MiB", gen=2, 230W
+# Expect: 4× "NVIDIA CMP 170HX, 65536 MiB", gen=2, 230W
 docker info >/dev/null && echo docker-ok
 sudo docker images | grep nvidia/cuda:13.0.2 || sudo docker pull nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
-# GPU 上如有其他模型容器，先停（互斥）:
-docker ps --format "{{.Names}}" | grep -E "vllm|glm|dsv4" && docker stop <名字>
+# Stop other model containers (GPU exclusive):
+docker ps --format "{{.Names}}" | grep -E "vllm|glm|dsv4" && docker stop <name>
 ```
 
-## 1. 模型下载（~157GB）
+## 1. Model download (~157GB)
 
 ```bash
 python3 -m venv ~/hfenv 2>/dev/null; ~/hfenv/bin/pip install -q -U huggingface_hub
-~/hfenv/bin/pip uninstall -y -q hf_xet hf_transfer   # [坑] Xet协议与镜像不兼容→401
+~/hfenv/bin/pip uninstall -y -q hf_xet hf_transfer   # [坑] Xet protocol incompatible with mirrors → 401
 mkdir -p ~/models/dsv4-flash-vision-exp
 HF_ENDPOINT=https://hf-mirror.com nohup ~/hfenv/bin/hf download \
   deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
   --local-dir ~/models/dsv4-flash-vision-exp > /tmp/dl-vision.log 2>&1 &
-# 日志出现 "✓ Downloaded" 即完整（hf自带校验）
+# "✓ Downloaded" in the log = complete (hf verifies checksums)
 ```
 
-## 1.5 构建物料预备（cp312 轮子 + rustup-init）
+## 1.5 Build material preparation (cp312 wheels + rustup-init)
 
 ```bash
 mkdir -p ~/tools/vision-wheels
 cat > /tmp/dlwheels.sh <<'EOF'
 #!/bin/bash
 cd ~/tools/vision-wheels
-export http_proxy=http://<代理机> https_proxy=http://<代理机>
+export http_proxy=http://<proxy> https_proxy=http://<proxy>
 for i in $(seq 1 30); do
   ~/hfenv/bin/pip download --no-cache-dir --python-version 3.12 --implementation cp \
     --abi cp312 --only-binary=:all: -d . \
@@ -44,17 +46,16 @@ for i in $(seq 1 30); do
   echo "retry $i"; sleep 10
 done
 EOF
-chmod +x /tmp/dlwheels.sh && /tmp/dlwheels.sh   # ~3.3GB, 重试环扛烂网
-# rustup-init (USTC 镜像)
+chmod +x /tmp/dlwheels.sh && /tmp/dlwheels.sh   # ~3.3GB, retry loop survives flaky networks
 curl -sL -o ~/tools/rustup-init \
   https://mirrors.ustc.edu.cn/rust-static/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
 chmod +x ~/tools/rustup-init
 ```
-[坑] 宿主 pip 默认按本机 Python 版本下轮子 — 必须带 `--python-version 3.12 --abi cp312`（容器是 3.12）。
+[坑] Host pip downloads wheels for the host Python version — you must pass `--python-version 3.12 --abi cp312` (the build container runs 3.12).
 
-## 2. 源码树组装（vision-v3 配方）
+## 2. Source tree assembly (vision-v3 recipe)
 
-四个部分的叠加，顺序固定：
+Four layered parts, in order:
 
 ```bash
 mkdir -p ~/tools && cd ~/tools
@@ -63,68 +64,34 @@ git clone --branch dsv4-vision-exp --single-branch \
 cd vllm-backport-vision
 git config user.email "m@local" && git config user.name "m"
 
-# 2.1 PR #54566 前四个提交（视觉支持基线，截止 9327439714）
+# 2.1 PR #54566 first four commits (vision support baseline, up to 9327439714)
 git fetch https://gh-proxy.com/https://github.com/vllm-project/vllm.git pull/54566/head:pr54566
 git cherry-pick edafe3dbe^..9327439714
-# 冲突处理：测试文件与同语义 gate-bias 条件 → 一律 git checkout --theirs
+# Conflicts (test files, semantically-identical gate-bias condition): git checkout --theirs
 
-# 2.2 cg 修复 + MTP 启用（从 PR 后续提交单摘）
-git cherry-pick 5ab628dd1     # fix breakable cg — 仅2行config，修复图模式下文本乱码
-git cherry-pick 2de7255a2     # enable mtp — VL草稿器管线
-# [坑] 不要用 PR 最新头（含 upstream main merge，带来 DeepGEMM 硬门，sm80 不可用）
+# 2.2 cg fix + MTP enable (cherry-pick individually from later PR commits)
+git cherry-pick 5ab628dd1     # fix breakable cg — 2-line config fix for graph-mode text corruption
+git cherry-pick 2de7255a2     # enable mtp — VL drafter plumbing
+# [坑] Do NOT use the PR's latest head (contains upstream main merge → DeepGEMM hard gate, unusable on sm80)
 
-# 2.3 sm80 三件套（无此三件 sm80 无法运行）
+# 2.3 The sm80 kit (three pieces, without them sm80 cannot run)
 mkdir -p vllm/models/deepseek_v4/ampere
-# ampere 后端来自 wtdcode master（34行薄封装：ROCm Triton路径+fp8_sm80软编解码）
-# 从 master 分支取 ampere/{__init__,ampere_sparse}.py 放入上述目录
-# 然后在 nvidia/model.py 打两个补丁：
-#   (a) sm80 选择器：后端选择函数开头插入
-#       if device_capability is not None and device_capability.major == 8:
-#           from vllm.models.deepseek_v4.ampere.ampere_sparse import DeepseekV4AmpereMLAAttention
-#           return DeepseekV4AmpereMLAAttention
-#   (b) PP input_ids 中继（bias_vl 路由需要，3处 hunks）：
-#       make_empty_intermediate_tensors 加 "dsv4_img_ids": torch.zeros((batch_size,), int64)
-#       非首rank: if input_ids is None: input_ids = intermediate_tensors["dsv4_img_ids"]
-#       首rank发送: IntermediateTensors({"hidden_states":…, "dsv4_img_ids": input_ids.to(int64)})
+# Take ampere/{__init__,ampere_sparse}.py from wtdcode master branch into the above dir
+# (a thin 34-line wrapper: ROCm Triton path + fp8_sm80 software encode/decode)
+# Then apply the selector + PP relay patches:
+python3 scripts/sm80-patches.py   # from this repository, run in the source tree root
 git add -A && git commit -m "sm80: ampere+selector+PP relay"
 
-# 2.4 DSpark 末阶嵌入补丁（投机解码必需）
-# nvidia/model.py 的 embed_tokens 构建条件改为：
-#   _spec = getattr(vllm_config, "speculative_config", None) is not None
-#   if get_pp_group().is_first_rank or (_spec and get_pp_group().is_last_rank):
-# 草稿器别名目标嵌入表 → spec开启时末阶也要建（+1GB显存）
+# 2.4 DSpark last-rank embedding patch (required for speculative decoding)
+#    — included in sm80-patches.py (embed-on-last-rank when spec is active, +1GB)
 git commit -am "sm80: embed on last rank for drafter"
 ```
 
-## 3. 构建（常驻编译容器，重启自动续编）
+## 3. Build (persistent container, auto-resumes across reboots)
 
 ```bash
-cat > ~/tools/vision-build-entry.sh <<'EOF'
-#!/bin/bash
-set -x
-export http_proxy=http://<代理机> https_proxy=http://<代理机> no_proxy=localhost,127.0.0.1,.ustc.edu.cn
-export PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/lib/ccache:/root/.cargo/bin:$PATH
-export CUDA_HOME=/usr/local/cuda CCACHE_DIR=/ccache
-export SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=48
-export CMAKE_BUILD_TYPE=Release VLLM_TARGET_DEVICE=cuda
-cd /src
-git config --system --add safe.directory /src   # [坑] 必须--system级（pip子进程换HOME）
-[ -x /opt/venv/bin/pip ] || {
-  apt-get update && apt-get install -y --no-install-recommends python3.12 python3.12-dev python3.12-venv git build-essential curl ca-certificates ccache cmake ninja-build
-  python3.12 -m venv /opt/venv
-  pip install --no-cache-dir -U pip "setuptools>=77.0.3,<81.0.0" wheel "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" ninja "cmake>=3.26.1" "packaging>=24.2" jinja2
-  /tmp/rustup-init -y --default-toolchain 1.95 --profile minimal
-  RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static /tmp/rustup-init -y --default-toolchain 1.95 --profile minimal
-  pip install --no-cache-dir --no-index --find-links /tmp/wheels torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
-}
-for i in 1 2 3 4 5; do
-  pip install --no-cache-dir -e . --no-build-isolation && { echo BUILD_OK > /src/.build_status; exit 0; }
-  echo "retry $i"; sleep 15
-done
-echo BUILD_FAILED > /src/.build_status
-EOF
-chmod +x ~/tools/vision-build-entry.sh
-
+# Copy scripts/build-entry.sh from this repo to ~/tools/vision-build-entry.sh
+# (edit BUILD_PROXY at the top), then:
 docker run -d --name vision-build --restart unless-stopped \
   -v ~/tools/vllm-backport-vision:/src \
   -v ~/tools/vision-wheels:/tmp/wheels:ro \
@@ -133,125 +100,102 @@ docker run -d --name vision-build --restart unless-stopped \
   -v ~/tools/vision-build-entry.sh:/entry.sh:ro \
   --entrypoint bash nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 \
   -c "while [ ! -f /src/.build_status ]; do bash /entry.sh >> /ccache/build.log 2>&1; sleep 30; done; sleep infinity"
-# 盯: tail -f ~/tools/vision-ccache/build.log；满载时 ~230 编译进程 / load 47
+# Monitor: tail -f ~/tools/vision-ccache/build.log (~230 compile processes at full load)
 
-# 构建完成后固化镜像（顺序铁律：start → exec安装 → stop → commit）
+# After BUILD_OK — bake the image (strict order: start → exec install → stop → commit)
 docker start vision-build
 docker exec vision-build bash -c "export PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/lib/ccache:/root/.cargo/bin:\$PATH CUDA_HOME=/usr/local/cuda CCACHE_DIR=/ccache SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=48; cd /src && pip uninstall -y vllm; pip install --no-build-isolation --no-cache-dir ."
-docker exec vision-build bash -c "export PATH=/opt/venv/bin:\$PATH; python3 -c 'import vllm; print(vllm.__file__)'"   # 必须指向 site-packages（非editable）
+docker exec vision-build bash -c "export PATH=/opt/venv/bin:\$PATH; python3 -c 'import vllm; print(vllm.__file__)'"   # must point to site-packages (NOT editable)
 docker stop vision-build
 docker commit vision-build dsv4-vision:sm80
 ```
 
-**[坑] 构建期网络**：GitHub 克隆走 gh-proxy（`git config --global url.https://gh-proxy.com/https://github.com/.insteadOf …`）+ `git config http.version HTTP/1.1`；rustup 必须 USTC 镜像直连（不走代理）。
+**[坑] Build-time networking**: GitHub clones via gh-proxy (`git config --global url.https://gh-proxy.com/https://github.com/.insteadOf …`) + `git config http.version HTTP/1.1`; rustup must use the USTC mirror directly (no proxy).
 
-## 4. 启动（生产参数）
+## 4. Launch (production parameters)
 
-```bash
-cat > ~/tools/launchVision.sh <<'EOF'
-#!/bin/bash
-docker stop -t 60 dsv4-vision >/dev/null 2>&1; docker rm dsv4-vision >/dev/null 2>&1
-docker run -d --name dsv4-vision --restart unless-stopped \
-  --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
-  -e HF_HUB_OFFLINE=1 -e NCCL_ALGO=Ring -e NCCL_PROTO=Simple \
-  -v /home/<user>/models/dsv4-flash-vision-exp:/model:ro \
-  --ipc=host -p 8096:8000 \
-  --entrypoint /opt/venv/bin/vllm dsv4-vision:sm80 serve /model \
-  --served-model-name dsv4-vision \
-  --pipeline-parallel-size 4 \
-  -e VLLM_PP_LAYER_PARTITION=12,11,11,9 \
-  --max-model-len 524288 --gpu-memory-utilization 0.93 \
-  --kv-cache-dtype fp8 --block-size 256 \
-  --max-num-batched-tokens 2048 --max-num-seqs 16 \
-  --trust-remote-code --disable-custom-all-reduce \
-  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
-  --tokenizer-mode deepseek_v4 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":3}' \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16,32,64],"max_cudagraph_capture_size":64}' \
-  --hf-overrides '{"head_dtype": "float32", "architectures": ["DeepseekV4ForConditionalGeneration"]}' \
-  --host 0.0.0.0 --port 8000
-EOF
-chmod +x ~/tools/launchVision.sh && sudo ~/tools/launchVision.sh
-```
+Use `scripts/launch.sh` from this repository, or the equivalent `docker run` with:
 
-**参数红线**：
-- `--entrypoint /opt/venv/bin/vllm` 必须显式（commit 镜像默认 entrypoint 是 bash）
-- PP=4 禁 TP（Gen2x4 无 P2P）；`VLLM_PP_LAYER_PARTITION=12,11,11,9`（rank3 扛草稿器+嵌入+lm_head，少给层 → KV 池 3.3 倍）
-- **DSpark n=3**：VL checkpoint 草稿器是 3 层 nextn（n 必须整除 3）；n=6 单流快 18% 但并发聚合崩（对话 C16 差 3 倍）—— 并发场景一律 n=3
-- `--kv-cache-dtype fp8`（不是 fp8_ds_mla，那会撞 fp8e4nv）
-- 图模式必须 FULL_AND_PIECEWISE + NCCL 钉死（enforce-eager 会 3.3 tok/s）
-- util 0.93 上限（0.95 有捕获 OOM 风险）
+**Parameter red lines**:
+- `--entrypoint /opt/venv/bin/vllm` must be explicit (committed images default to bash)
+- PP=4, never TP (Gen2 x4, no P2P); `VLLM_PP_LAYER_PARTITION=12,11,11,9` (rank 3 carries drafter + embedding + lm_head → fewer layers → 3.3× KV pool)
+- **DSpark n=3**: the VL checkpoint ships a 3-layer nextn drafter (n must divide 3); n=6 is 18% faster single-stream but collapses under concurrency (3× worse at C=16)
+- `--kv-cache-dtype fp8` (not fp8_ds_mla — that hits fp8e4nv)
+- Graph mode must be FULL_AND_PIECEWISE + pinned NCCL (enforce-eager = 3.3 tok/s)
+- util ≤ 0.93 (0.95 risks capture OOM)
 
-## 5. 验收清单
+## 5. Acceptance checklist
 
 ```bash
-# 5.1 就绪（~10min：载权重+warmup）
+# 5.1 Readiness (~10min: weight load + warmup)
 curl -s localhost:8096/health        # 200
 docker logs dsv4-vision 2>&1 | grep "KV cache size"
-# 期望: ~4,719,096 tokens；"Maximum concurrency for 524,288: 9.00x"
+# Expect: ~4,719,096 tokens; "Maximum concurrency for 524,288: 9.00x"
 
-# 5.2 文本冒烟（正确性关键 — cg修复验证）
+# 5.2 Text smoke (correctness — the cg-fix verification)
 curl -s localhost:8096/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"dsv4-vision","messages":[{"role":"user","content":"中国的首都是哪座城市？直接回答"}],
+  -d '{"model":"dsv4-vision","messages":[{"role":"user","content":"What is the capital of China? Answer directly."}],
        "max_tokens":40,"chat_template_kwargs":{"thinking":false},"temperature":0}'
-# 期望: "北京"（若返回无关内容=图模式损坏，检查 5ab628dd1 是否摘入）
+# Expect: "Beijing" (unrelated content = graph-mode corruption → check 5ab628dd1)
 
-# 5.3 视觉（base64）
+# 5.3 Vision (base64)
 # content blocks: [{"type":"text",...},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]
-# 期望: 官方 carrots.jpeg → "胡萝卜"
 
-# 5.4 工具调用
-# 带 tools 参数 → tool_calls: [{function: {name:..., arguments:...}}], finish_reason: "tool_calls"
+# 5.4 Tool calling
+# With tools param → tool_calls: [{function: {name:..., arguments:...}}], finish_reason: "tool_calls"
+
+# Or run the full suite:
+python3 bench/bench.py
 ```
 
-## 6. 性能参考（实测 @230W，512k 窗口，DSpark n=3）
+## 6. Performance reference (measured @230W, 512k, DSpark n=3)
 
-| 场景 | 数值 |
+| Scenario | Value |
 |---|---|
-| 单流解码（浅层） | 49 tok/s（n=6 时 58） |
-| 单流解码（85k-366k 深度） | **88-92 tok/s，与深度无关** |
-| TTFT | 1k=1.1s / 85k=16s / 163k=32s / 366k=94s（prefill ~4k t/s） |
-| 视觉问答 | 首问 ~1.4s / 热问 0.4-0.5s |
-| Agent 聚合 | C8=379 / C16=497（峰值）/ C32=404 t/s |
-| 对话聚合 | C32=439 t/s |
-| 并发甜点 | ≤8 交互 / ≤16 agent；>16 排队劣化 |
-| KV 池 | 471.9 万 token；满 512k 窗口 9 路 |
-| DSpark 接受长度 | 2.28（n=3）/ 2.67（n=6） |
+| Single-stream decode (shallow) | 49 tok/s (58 with n=6) |
+| Single-stream decode (85k–366k depth) | **88–92 tok/s, depth-independent** |
+| TTFT | 1k=1.1s / 85k=16s / 163k=32s / 366k=94s (prefill ~4k t/s) |
+| Vision QA | first ~1.4s / hot 0.4–0.5s |
+| Agent aggregate | C8=379 / C16=497 (peak) / C32=404 t/s |
+| Chat aggregate | C32=439 t/s |
+| Concurrency sweet spot | ≤8 interactive / ≤16 agent; >16 queueing degrades |
+| KV pool | 4.719M tokens; 9 concurrent full-512k sessions |
+| DSpark acceptance length | 2.28 (n=3) / 2.67 (n=6) |
 
-## 7. 运维
+## 7. Operations
 
-| 症状 | 处置 |
+| Symptom | Remedy |
 |---|---|
-| 容器重启循环 + `No module named vllm` | 镜像被坏 commit 覆盖 → 重走第3节安装+commit（顺序：start→exec→stop→commit） |
-| 文本返回无关内容 | 图模式 cg bug → 确认 5ab628dd1 在树上；验证：echo 测试看服务器侧 prompt |
-| `fp8e4nv not supported` | 用了非 Ampere 后端 → 确认 sm80 选择器补丁在 |
-| `vision MoE routing requires input_ids` | PP 中继未生效 → 检查 3 处 dsv4_img_ids hunks |
-| `requires DeepGEMM` | 用了 PR merge 后的树 → 回到 vision-v3 配方（不要 merge upstream main） |
-| 深度"解码慢" | **先检查测量方法**：必须 TTFT 分离（流式首 content 时刻）+ usage 计数；total/tokens 是错的 |
+| Restart loop + `No module named vllm` | Image overwritten by a bad commit → redo §3 install+commit (order: start→exec→stop→commit) |
+| Text returns unrelated content | Graph-mode cg bug → verify 5ab628dd1 is in the tree |
+| `fp8e4nv not supported` | Non-Ampere backend selected → verify the sm80 selector patch |
+| `vision MoE routing requires input_ids` | PP relay not effective → check the 3 dsv4_img_ids hunks |
+| `requires DeepGEMM` | Tree includes the upstream main merge → return to the vision-v3 recipe |
+| Deep decode "slow" | **Check measurement method first**: TTFT must be separated (streaming first-content time) + usage-counted tokens; total/tokens is wrong |
 
-## 8. 接入 fleet
+## 8. Gateway integration
 
 ```yaml
-# 网关机 litellm config.yaml 追加（注意零缩进风格）：
+# litellm config.yaml (zero-indent list style):
 - model_name: dsv4-vision
   litellm_params:
     model: openai/dsv4-vision
-    api_base: http://<本机IP>:8096/v1
+    api_base: http://<host-ip>:8096/v1
     api_key: none
     request_timeout: 3600
     stream_timeout: 3600
 ```
 
-## 9. 使用守则
+## 9. Usage guidelines
 
-- 图像 + 常规对话（<32k）：全速
-- 深上下文（≤400k）**长写完全可用**（88 tok/s 深度平坦），只是首字等 prefill（85k=16s / 366k=94s）
-- 每图 ≤384 token；min_pixels 147456（过小图被放大）；宽高比 ≤8
-- 精度敏感判断开 thinking（返回字段名是 `reasoning` 非 `reasoning_content`）
-- 单机互斥：显存只够一个模型。需要纯文本高并发（C64 聚合 1600+ t/s）时换 `dsv4-flash-deploy-runbook.md` 的文本服务；需要图像/深上下文（88 tok/s 平到 400k）时换本服务
+- Images + regular conversation (<32k): full speed
+- Deep context (≤400k) **long-form generation fully usable** (88 tok/s depth-flat); only the first token waits for prefill
+- Per image ≤384 tokens; min_pixels 147456 (smaller images get upscaled); aspect ratio ≤8
+- For precision-sensitive reasoning enable thinking (response field is `reasoning`, not `reasoning_content`)
+- Single-model exclusive: the same hardware can alternatively run the text-only 0731 recipe (see machine-setup.zh-CN.md §4+); switching = stop one container, start the other (~10min)
 
-## 10. 已知边界
+## 10. Known limits
 
-- MTP method 不可用（checkpoint 无 mtp_block 权重，只有 DSpark 草稿头）
-- 1M 窗口未开（KV 池 472 万 < 1M 单请求装不下；需 8 卡或等上游压缩存储）
-- DSpark n=6 仅适合 ≤2 路纯交互实例
+- MTP method unavailable (checkpoint ships DSpark drafter only, no mtp_block weights)
+- 1M window not enabled (KV pool 4.72M < 1M single request; needs 8 cards or upstream compressed KV storage)
+- DSpark n=6 only for ≤2-way pure-interactive instances
