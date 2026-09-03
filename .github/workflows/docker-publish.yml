@@ -1,0 +1,140 @@
+name: Docker Publish
+
+on:
+  push:
+    branches:
+      - master
+      - dsv4-a6000-opt
+    tags:
+      - "v*"
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cancel-stale:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel older in-progress runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for status in in_progress queued; do
+            gh run list -R ${{ github.repository }} -w "${{ github.workflow }}" \
+              --branch "${{ github.ref_name }}" \
+              --status $status --json databaseId -q '.[].databaseId'
+          done | while read -r id; do
+            if [ "$id" != "${{ github.run_id }}" ]; then
+              gh run cancel "$id" -R ${{ github.repository }} || true
+            fi
+          done
+
+  build-and-push:
+    # On a repo with a self-hosted builder, set the repo variable
+    # BUILD_RUNNER (e.g. "self-hosted"); GitHub-hosted otherwise.
+    runs-on: self-hosted
+    timeout-minutes: 2880
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: "8.6"
+            suffix: sm86
+            tags: lazymio/vllm-backport:latest-sm86,lazymio/vllm-backport:latest
+          - arch: "8.0"
+            suffix: sm80
+            tags: lazymio/vllm-backport:latest-sm80
+          - arch: "8.9"
+            suffix: sm89
+            tags: lazymio/vllm-backport:latest-sm89
+    steps:
+      - name: Free disk space
+        # GitHub-hosted runners only: a cold build overflows their small
+        # root disk. Self-hosted builders manage their own storage.
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/local/.ghcup /usr/share/swift /usr/local/share/chromium \
+            /usr/local/lib/node_modules /usr/lib/google-cloud-sdk \
+            /usr/local/aws-cli /usr/local/aws-sam-cli /usr/lib/jvm \
+            /usr/lib/firefox /opt/microsoft /var/lib/gems /usr/share/miniconda
+          sudo docker image prune -af
+          # A cold full build overflows the root disk (v0.7.0 run died with
+          # "No space left on device" while packaging the wheel). The runner's
+          # second disk (/mnt, ~65 GB) is otherwise unused: move docker's
+          # data-root there so image layers and the buildkit builder don't
+          # compete with the workspace and ccache for the root filesystem.
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker /etc/docker
+          if [ -s /etc/docker/daemon.json ]; then
+            sudo jq '. + {"data-root": "/mnt/docker"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl start docker
+          df -h / /mnt
+
+      - uses: actions/checkout@v4
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ccache-dir
+          key: ccache-${{ matrix.suffix }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.suffix }}-
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Inject ccache into build
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {
+              "ccache-dir": "/root/.cache/ccache"
+            }
+
+      - uses: docker/login-action@v3
+        with:
+          username: lazymio
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Size build parallelism to this runner
+        id: parallelism
+        run: |
+          CORES=$(nproc)
+          MEM_GB=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 / 1024 ))
+          JOBS=$(( MEM_GB / 4 ))
+          [ "$JOBS" -gt "$CORES" ] && JOBS=$CORES
+          [ "$JOBS" -lt 2 ] && JOBS=2
+          echo "max_jobs=$JOBS" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        timeout-minutes: 2400
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: vllm-openai
+          push: true
+          # Tag builds publish the version tag *and* the rolling latest tags,
+          # so latest always tracks the newest build rather than the last
+          # branch push.
+          tags: ${{ startsWith(github.ref, 'refs/tags/') && format('lazymio/vllm-backport:{0}-{1},{2}', github.ref_name, matrix.suffix, matrix.tags) || matrix.tags }}
+          cache-from: type=registry,ref=lazymio/vllm-backport:buildcache-${{ matrix.suffix }}
+          cache-to: type=registry,ref=lazymio/vllm-backport:buildcache-${{ matrix.suffix }},mode=max,compression=zstd,ignore-error=true
+          build-args: |
+            torch_cuda_arch_list=${{ matrix.arch }}
+            max_jobs=${{ steps.parallelism.outputs.max_jobs }}
+            nvcc_threads=1
+            INSTALL_LMCACHE=true
